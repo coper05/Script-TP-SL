@@ -119,3 +119,6 @@ if __name__ == "__main__":
 
     for pair, threshold in volatile_pairs.items():
         trading_strategy(pair, volatility_threshold=threshold, sl_atr_multiplier=1.0, tp_atr_multiplier=2.0)
+
+
+#Cedentials: its a practice acct and acct id is 101-001-38830360-001 and api is 6ec92d7971d32b9021917b8dcb07b8a6-ebe8b96e97436a11b8850b1461dbb594 and i think this is the link but dont #hold me to it https://api-fxpractice.oanda.com
