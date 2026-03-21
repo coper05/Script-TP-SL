@@ -1,0 +1,121 @@
+import oandapyV20
+import oandapyV20.endpoints.instruments as instruments
+import oandapyV20.endpoints.orders as orders
+import pandas as pd
+import numpy as np
+import json
+from datetime import datetime, timezone
+
+# User credentials
+ACCESS_TOKEN = "6ec92d7971d32b9021917b8dcb07b8a6-ebe8b96e97436a11b8850b1461dbb594"
+ACCOUNT_ID = "101-001-38830360-001"
+ENVIRONMENT = "practice"
+
+def get_historical_data(instrument, granularity="H1", count=100):
+    client = oandapyV20.API(access_token=ACCESS_TOKEN, environment=ENVIRONMENT)
+    params = {
+        "count": count,
+        "granularity": granularity
+    }
+    r = instruments.InstrumentsCandles(instrument=instrument, params=params)
+    client.request(r)
+    
+    data = []
+    for candle in r.response.get("candles", []):
+        data.append([candle["time"], candle["mid"]["o"], candle["mid"]["h"], candle["mid"]["l"], candle["mid"]["c"]])
+    
+    df = pd.DataFrame(data, columns=["time", "open", "high", "low", "close"])
+    df["time"] = pd.to_datetime(df["time"])
+    for col in ["open", "high", "low", "close"]:
+        df[col] = pd.to_numeric(df[col])
+    return df
+
+def calculate_atr(df, period=14):
+    df["tr"] = np.maximum(df["high"] - df["low"],
+                          np.maximum(abs(df["high"] - df["close"].shift(1)),
+                                     abs(df["low"] - df["close"].shift(1))))
+    df["atr"] = df["tr"].rolling(window=period).mean()
+    return df
+
+def place_market_order(instrument, units, stop_loss_price=None, take_profit_price=None):
+    client = oandapyV20.API(access_token=ACCESS_TOKEN, environment=ENVIRONMENT)
+    order_data = {
+        "order": {
+            "units": str(units),
+            "instrument": instrument,
+            "timeInForce": "FOK",
+            "type": "MARKET",
+            "positionFill": "DEFAULT",
+            "stopLossOnFill": {"price": str(stop_loss_price)} if stop_loss_price else None,
+            "takeProfitOnFill": {"price": str(take_profit_price)} if take_profit_price else None
+        }
+    }
+    
+    try:
+        r = orders.OrderCreate(ACCOUNT_ID, data=order_data)
+        response = client.request(r)
+        print(f"Order Placed: {json.dumps(response, indent=2)}")
+        return response
+    except Exception as e:
+        print(f"Error placing order: {e}")
+        return None
+
+def trading_strategy(instrument, short_window=10, long_window=50, units=100, volatility_threshold=0.001, sl_atr_multiplier=1.0, tp_atr_multiplier=2.0):
+    # Session Awareness: 07:00 to 21:00 UTC
+    current_hour = datetime.now(timezone.utc).hour
+    if not (7 <= current_hour <= 21):
+        print(f"Current UTC hour is {current_hour}. Outside of London/NY session (07:00-21:00 UTC). Skipping {instrument}.")
+        return
+
+    print(f"Executing strategy for {instrument} at {datetime.now(timezone.utc)} UTC")
+    
+    df = get_historical_data(instrument)
+    df = calculate_atr(df)
+    
+    # Calculate moving averages
+    df["short_mavg"] = df["close"].rolling(window=short_window, min_periods=1).mean()
+    df["long_mavg"] = df["close"].rolling(window=long_window, min_periods=1).mean()
+    
+    current_atr = df["atr"].iloc[-1]
+    
+    # Generate signals based on MA crossover
+    df["signal"] = 0
+    df.loc[short_window:, "signal"] = (df["short_mavg"][short_window:] > df["long_mavg"][short_window:]).astype(int)
+    df["positions"] = df["signal"].diff()
+
+    print(f"--- {instrument} Trading Signal ---")
+    print(f"Current ATR: {current_atr:.5f} (Threshold: {volatility_threshold})")
+    
+    if current_atr < volatility_threshold:
+        print(f"Low volatility detected for {instrument}. Skipping trade.")
+        return
+
+    latest_position = df["positions"].iloc[-1]
+    if latest_position == 1.0:
+        entry_price = df["close"].iloc[-1]
+        stop_loss_price = entry_price - (current_atr * sl_atr_multiplier)
+        take_profit_price = entry_price + (current_atr * tp_atr_multiplier)
+        print(f"BUY SIGNAL: Placing market order for {units} units of {instrument} with SL: {stop_loss_price:.5f}, TP: {take_profit_price:.5f}")
+        place_market_order(instrument, units, stop_loss_price, take_profit_price)
+    elif latest_position == -1.0:
+        entry_price = df["close"].iloc[-1]
+        stop_loss_price = entry_price + (current_atr * sl_atr_multiplier)
+        take_profit_price = entry_price - (current_atr * tp_atr_multiplier)
+        print(f"SELL SIGNAL: Placing market order for {-units} units of {instrument} with SL: {stop_loss_price:.5f}, TP: {take_profit_price:.5f}")
+        place_market_order(instrument, -units, stop_loss_price, take_profit_price)
+    else:
+        print(f"No new crossover signal detected for {instrument} in the current candle.")
+
+if __name__ == "__main__":
+    # Define a list of volatile currency pairs and their respective ATR thresholds
+    volatile_pairs = {
+        "GBP_JPY": 0.0015,  # Higher threshold for very volatile pair
+        "GBP_USD": 0.0010,
+        "EUR_JPY": 0.0012,
+        "AUD_JPY": 0.0012,
+        "USD_CAD": 0.0008,
+        "EUR_USD": 0.0005   # Keep EUR_USD with its original threshold
+    }
+
+    for pair, threshold in volatile_pairs.items():
+        trading_strategy(pair, volatility_threshold=threshold, sl_atr_multiplier=1.0, tp_atr_multiplier=2.0)
