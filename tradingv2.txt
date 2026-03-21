@@ -39,6 +39,7 @@ def calculate_atr(df, period=14):
 
 def place_market_order(instrument, units, stop_loss_price=None, take_profit_price=None):
     client = oandapyV20.API(access_token=ACCESS_TOKEN, environment=ENVIRONMENT)
+    precision = 3 if "JPY" in instrument else 5
     order_data = {
         "order": {
             "units": str(units),
@@ -46,8 +47,8 @@ def place_market_order(instrument, units, stop_loss_price=None, take_profit_pric
             "timeInForce": "FOK",
             "type": "MARKET",
             "positionFill": "DEFAULT",
-            "stopLossOnFill": {"price": str(stop_loss_price)} if stop_loss_price else None,
-            "takeProfitOnFill": {"price": str(take_profit_price)} if take_profit_price else None
+            "stopLossOnFill": {"price": f"{stop_loss_price:.{precision}f}"} if stop_loss_price else None,
+            "takeProfitOnFill": {"price": f"{take_profit_price:.{precision}f}"} if take_profit_price else None
         }
     }
     
