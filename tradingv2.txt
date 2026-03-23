@@ -1,6 +1,8 @@
 import oandapyV20
 import oandapyV20.endpoints.instruments as instruments
 import oandapyV20.endpoints.orders as orders
+import oandapyV20.endpoints.trades as trades_ep
+import oandapyV20.endpoints.positions as positions_ep
 import pandas as pd
 import numpy as np
 import json
@@ -11,6 +13,42 @@ ACCESS_TOKEN = "6ec92d7971d32b9021917b8dcb07b8a6-ebe8b96e97436a11b8850b1461dbb59
 ACCOUNT_ID = "101-001-38830360-001"
 ENVIRONMENT = "practice"
 
+# --- Risk Management Settings ---
+MAX_SIMULTANEOUS_TRADES = 3  # Maximum number of open trades allowed at any time
+
+
+def get_open_trades():
+    """Fetch all currently open trades from OANDA and return as a list."""
+    client = oandapyV20.API(access_token=ACCESS_TOKEN, environment=ENVIRONMENT)
+    r = trades_ep.TradesList(ACCOUNT_ID, params={"state": "OPEN"})
+    client.request(r)
+    return r.response.get("trades", [])
+
+
+def get_open_trade_for_pair(instrument, open_trades):
+    """
+    Check if there is an existing open trade for the given instrument.
+    Returns the trade dict if found, otherwise None.
+    """
+    for trade in open_trades:
+        if trade["instrument"] == instrument:
+            return trade
+    return None
+
+
+def close_trade(trade_id):
+    """Close an open trade by its trade ID."""
+    client = oandapyV20.API(access_token=ACCESS_TOKEN, environment=ENVIRONMENT)
+    r = trades_ep.TradeClose(ACCOUNT_ID, tradeID=trade_id)
+    try:
+        response = client.request(r)
+        print(f"Trade {trade_id} closed successfully.")
+        return response
+    except Exception as e:
+        print(f"Error closing trade {trade_id}: {e}")
+        return None
+
+
 def get_historical_data(instrument, granularity="H1", count=100):
     client = oandapyV20.API(access_token=ACCESS_TOKEN, environment=ENVIRONMENT)
     params = {
@@ -19,16 +57,17 @@ def get_historical_data(instrument, granularity="H1", count=100):
     }
     r = instruments.InstrumentsCandles(instrument=instrument, params=params)
     client.request(r)
-    
+
     data = []
     for candle in r.response.get("candles", []):
         data.append([candle["time"], candle["mid"]["o"], candle["mid"]["h"], candle["mid"]["l"], candle["mid"]["c"]])
-    
+
     df = pd.DataFrame(data, columns=["time", "open", "high", "low", "close"])
     df["time"] = pd.to_datetime(df["time"])
     for col in ["open", "high", "low", "close"]:
         df[col] = pd.to_numeric(df[col])
     return df
+
 
 def calculate_atr(df, period=14):
     df["tr"] = np.maximum(df["high"] - df["low"],
@@ -36,6 +75,7 @@ def calculate_atr(df, period=14):
                                      abs(df["low"] - df["close"].shift(1))))
     df["atr"] = df["tr"].rolling(window=period).mean()
     return df
+
 
 def place_market_order(instrument, units, stop_loss_price=None, take_profit_price=None):
     client = oandapyV20.API(access_token=ACCESS_TOKEN, environment=ENVIRONMENT)
@@ -51,7 +91,7 @@ def place_market_order(instrument, units, stop_loss_price=None, take_profit_pric
             "takeProfitOnFill": {"price": f"{take_profit_price:.{precision}f}"} if take_profit_price else None
         }
     }
-    
+
     try:
         r = orders.OrderCreate(ACCOUNT_ID, data=order_data)
         response = client.request(r)
@@ -61,24 +101,31 @@ def place_market_order(instrument, units, stop_loss_price=None, take_profit_pric
         print(f"Error placing order: {e}")
         return None
 
-def trading_strategy(instrument, short_window=10, long_window=50, units=100, volatility_threshold=0.001, sl_atr_multiplier=1.0, tp_atr_multiplier=2.0):
+
+def trading_strategy(instrument, open_trades, short_window=10, long_window=50, units=100,
+                     volatility_threshold=0.001, sl_atr_multiplier=1.0, tp_atr_multiplier=2.0):
     # Session Awareness: 07:00 to 21:00 UTC
     current_hour = datetime.now(timezone.utc).hour
     if not (7 <= current_hour <= 21):
         print(f"Current UTC hour is {current_hour}. Outside of London/NY session (07:00-21:00 UTC). Skipping {instrument}.")
         return
 
-    print(f"Executing strategy for {instrument} at {datetime.now(timezone.utc)} UTC")
-    
+    print(f"\nExecuting strategy for {instrument} at {datetime.now(timezone.utc)} UTC")
+
+    # --- Safeguard 1: Max simultaneous trades cap ---
+    if len(open_trades) >= MAX_SIMULTANEOUS_TRADES:
+        print(f"Max simultaneous trades ({MAX_SIMULTANEOUS_TRADES}) reached. Skipping {instrument}.")
+        return
+
     df = get_historical_data(instrument)
     df = calculate_atr(df)
-    
+
     # Calculate moving averages
     df["short_mavg"] = df["close"].rolling(window=short_window, min_periods=1).mean()
     df["long_mavg"] = df["close"].rolling(window=long_window, min_periods=1).mean()
-    
+
     current_atr = df["atr"].iloc[-1]
-    
+
     # Generate signals based on MA crossover
     df["signal"] = 0
     df.loc[short_window:, "signal"] = (df["short_mavg"][short_window:] > df["long_mavg"][short_window:]).astype(int)
@@ -86,26 +133,59 @@ def trading_strategy(instrument, short_window=10, long_window=50, units=100, vol
 
     print(f"--- {instrument} Trading Signal ---")
     print(f"Current ATR: {current_atr:.5f} (Threshold: {volatility_threshold})")
-    
+
     if current_atr < volatility_threshold:
         print(f"Low volatility detected for {instrument}. Skipping trade.")
         return
 
     latest_position = df["positions"].iloc[-1]
-    if latest_position == 1.0:
+
+    # --- Safeguard 2: Per-pair open position check + Safeguard 3: Direction flip logic ---
+    existing_trade = get_open_trade_for_pair(instrument, open_trades)
+
+    if latest_position == 1.0:  # BUY signal
         entry_price = df["close"].iloc[-1]
         stop_loss_price = entry_price - (current_atr * sl_atr_multiplier)
         take_profit_price = entry_price + (current_atr * tp_atr_multiplier)
+
+        if existing_trade:
+            existing_units = float(existing_trade["currentUnits"])
+            if existing_units > 0:
+                # Already long on this pair — no stacking
+                print(f"BUY signal detected but a LONG trade already exists for {instrument} (Trade ID: {existing_trade['id']}). Skipping to avoid stacking.")
+                return
+            else:
+                # Existing trade is SHORT — direction flip: close and reverse to BUY
+                print(f"BUY signal detected. Existing SHORT trade found for {instrument} (Trade ID: {existing_trade['id']}). Closing SHORT and reversing to BUY.")
+                close_trade(existing_trade["id"])
+                open_trades = [t for t in open_trades if t["id"] != existing_trade["id"]]  # Update local count
+
         print(f"BUY SIGNAL: Placing market order for {units} units of {instrument} with SL: {stop_loss_price:.5f}, TP: {take_profit_price:.5f}")
         place_market_order(instrument, units, stop_loss_price, take_profit_price)
-    elif latest_position == -1.0:
+
+    elif latest_position == -1.0:  # SELL signal
         entry_price = df["close"].iloc[-1]
         stop_loss_price = entry_price + (current_atr * sl_atr_multiplier)
         take_profit_price = entry_price - (current_atr * tp_atr_multiplier)
+
+        if existing_trade:
+            existing_units = float(existing_trade["currentUnits"])
+            if existing_units < 0:
+                # Already short on this pair — no stacking
+                print(f"SELL signal detected but a SHORT trade already exists for {instrument} (Trade ID: {existing_trade['id']}). Skipping to avoid stacking.")
+                return
+            else:
+                # Existing trade is LONG — direction flip: close and reverse to SELL
+                print(f"SELL signal detected. Existing LONG trade found for {instrument} (Trade ID: {existing_trade['id']}). Closing LONG and reversing to SELL.")
+                close_trade(existing_trade["id"])
+                open_trades = [t for t in open_trades if t["id"] != existing_trade["id"]]  # Update local count
+
         print(f"SELL SIGNAL: Placing market order for {-units} units of {instrument} with SL: {stop_loss_price:.5f}, TP: {take_profit_price:.5f}")
         place_market_order(instrument, -units, stop_loss_price, take_profit_price)
+
     else:
         print(f"No new crossover signal detected for {instrument} in the current candle.")
+
 
 if __name__ == "__main__":
     # Define a list of volatile currency pairs and their respective ATR thresholds
@@ -118,8 +198,18 @@ if __name__ == "__main__":
         "EUR_USD": 0.0005   # Keep EUR_USD with its original threshold
     }
 
+    # Fetch all open trades once at the start of each run for efficiency
+    print("Fetching current open trades from OANDA...")
+    open_trades = get_open_trades()
+    print(f"Open trades found: {len(open_trades)} / {MAX_SIMULTANEOUS_TRADES} max allowed")
+    for t in open_trades:
+        direction = "LONG" if float(t["currentUnits"]) > 0 else "SHORT"
+        print(f"  - {t['instrument']} | {direction} | Units: {t['currentUnits']} | Trade ID: {t['id']}")
+
     for pair, threshold in volatile_pairs.items():
-        trading_strategy(pair, volatility_threshold=threshold, sl_atr_multiplier=1.0, tp_atr_multiplier=2.0)
+        trading_strategy(pair, open_trades, volatility_threshold=threshold, sl_atr_multiplier=1.0, tp_atr_multiplier=2.0)
 
 
-#Cedentials: its a practice acct and acct id is 101-001-38830360-001 and api is 6ec92d7971d32b9021917b8dcb07b8a6-ebe8b96e97436a11b8850b1461dbb594 and i think this is the link but dont #hold me to it https://api-fxpractice.oanda.com
+# Credentials: practice account | Account ID: 101-001-38830360-001
+# API Token: 6ec92d7971d32b9021917b8dcb07b8a6-ebe8b96e97436a11b8850b1461dbb594
+# Practice API endpoint: https://api-fxpractice.oanda.com
