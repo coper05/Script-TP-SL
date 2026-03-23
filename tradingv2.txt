@@ -2,7 +2,7 @@ import oandapyV20
 import oandapyV20.endpoints.instruments as instruments
 import oandapyV20.endpoints.orders as orders
 import oandapyV20.endpoints.trades as trades_ep
-import oandapyV20.endpoints.positions as positions_ep
+import oandapyV20.endpoints.accounts as accounts_ep
 import pandas as pd
 import numpy as np
 import json
@@ -14,7 +14,53 @@ ACCOUNT_ID = "101-001-38830360-001"
 ENVIRONMENT = "practice"
 
 # --- Risk Management Settings ---
-MAX_SIMULTANEOUS_TRADES = 3  # Maximum number of open trades allowed at any time
+MAX_SIMULTANEOUS_TRADES = 3   # Maximum number of open trades allowed at any time
+BALANCE_FLOOR = 125.0         # Minimum protected balance — unit sizing never drops below base at this level
+
+# --- Dynamic Unit Sizing Tiers ---
+# Based on $10/week profit progression starting at $125
+# Units scale up as balance grows, and step back down automatically after withdrawals
+UNIT_TIERS = [
+    (125,  400),   # $125–$149   → 400 units  (~$10/week target)
+    (150,  480),   # $150–$174   → 480 units
+    (175,  560),   # $175–$199   → 560 units
+    (200,  800),   # $200–$249   → 800 units  (~$20/week target)
+    (250, 1000),   # $250–$299   → 1,000 units
+    (300, 1200),   # $300–$349   → 1,200 units
+    (350, 1400),   # $350–$399   → 1,400 units
+    (400, 1600),   # $400–$449   → 1,600 units
+    (450, 1800),   # $450–$499   → 1,800 units
+    (500, 2000),   # $500–$599   → 2,000 units (~$50/week target)
+    (600, 2400),   # $600+       → 2,400 units
+]
+
+
+def get_account_balance():
+    """Fetch the current account balance from OANDA."""
+    client = oandapyV20.API(access_token=ACCESS_TOKEN, environment=ENVIRONMENT)
+    r = accounts_ep.AccountSummary(ACCOUNT_ID)
+    client.request(r)
+    balance = float(r.response["account"]["balance"])
+    return balance
+
+
+def calculate_dynamic_units(balance):
+    """
+    Determine the appropriate unit size based on current account balance.
+    Uses the UNIT_TIERS progression anchored to the $125 floor.
+    If balance is below the floor, use the minimum base unit size (400).
+    """
+    if balance < BALANCE_FLOOR:
+        print(f"WARNING: Balance ${balance:.2f} is below the protected floor of ${BALANCE_FLOOR:.2f}. Using minimum unit size of 400.")
+        return 400
+
+    units = 400  # Default to base tier
+    for tier_balance, tier_units in UNIT_TIERS:
+        if balance >= tier_balance:
+            units = tier_units
+        else:
+            break
+    return units
 
 
 def get_open_trades():
@@ -102,7 +148,7 @@ def place_market_order(instrument, units, stop_loss_price=None, take_profit_pric
         return None
 
 
-def trading_strategy(instrument, open_trades, short_window=10, long_window=50, units=100,
+def trading_strategy(instrument, open_trades, units, short_window=10, long_window=50,
                      volatility_threshold=0.001, sl_atr_multiplier=1.0, tp_atr_multiplier=2.0):
     # Session Awareness: 07:00 to 21:00 UTC
     current_hour = datetime.now(timezone.utc).hour
@@ -151,14 +197,14 @@ def trading_strategy(instrument, open_trades, short_window=10, long_window=50, u
         if existing_trade:
             existing_units = float(existing_trade["currentUnits"])
             if existing_units > 0:
-                # Already long on this pair — no stacking
+                # Already long — no stacking
                 print(f"BUY signal detected but a LONG trade already exists for {instrument} (Trade ID: {existing_trade['id']}). Skipping to avoid stacking.")
                 return
             else:
-                # Existing trade is SHORT — direction flip: close and reverse to BUY
+                # Existing SHORT — direction flip: close and reverse to BUY
                 print(f"BUY signal detected. Existing SHORT trade found for {instrument} (Trade ID: {existing_trade['id']}). Closing SHORT and reversing to BUY.")
                 close_trade(existing_trade["id"])
-                open_trades = [t for t in open_trades if t["id"] != existing_trade["id"]]  # Update local count
+                open_trades = [t for t in open_trades if t["id"] != existing_trade["id"]]
 
         print(f"BUY SIGNAL: Placing market order for {units} units of {instrument} with SL: {stop_loss_price:.5f}, TP: {take_profit_price:.5f}")
         place_market_order(instrument, units, stop_loss_price, take_profit_price)
@@ -171,14 +217,14 @@ def trading_strategy(instrument, open_trades, short_window=10, long_window=50, u
         if existing_trade:
             existing_units = float(existing_trade["currentUnits"])
             if existing_units < 0:
-                # Already short on this pair — no stacking
+                # Already short — no stacking
                 print(f"SELL signal detected but a SHORT trade already exists for {instrument} (Trade ID: {existing_trade['id']}). Skipping to avoid stacking.")
                 return
             else:
-                # Existing trade is LONG — direction flip: close and reverse to SELL
+                # Existing LONG — direction flip: close and reverse to SELL
                 print(f"SELL signal detected. Existing LONG trade found for {instrument} (Trade ID: {existing_trade['id']}). Closing LONG and reversing to SELL.")
                 close_trade(existing_trade["id"])
-                open_trades = [t for t in open_trades if t["id"] != existing_trade["id"]]  # Update local count
+                open_trades = [t for t in open_trades if t["id"] != existing_trade["id"]]
 
         print(f"SELL SIGNAL: Placing market order for {-units} units of {instrument} with SL: {stop_loss_price:.5f}, TP: {take_profit_price:.5f}")
         place_market_order(instrument, -units, stop_loss_price, take_profit_price)
@@ -190,24 +236,35 @@ def trading_strategy(instrument, open_trades, short_window=10, long_window=50, u
 if __name__ == "__main__":
     # Define a list of volatile currency pairs and their respective ATR thresholds
     volatile_pairs = {
-        "GBP_JPY": 0.0015,  # Higher threshold for very volatile pair
+        "GBP_JPY": 0.0015,
         "GBP_USD": 0.0010,
         "EUR_JPY": 0.0012,
         "AUD_JPY": 0.0012,
         "USD_CAD": 0.0008,
-        "EUR_USD": 0.0005   # Keep EUR_USD with its original threshold
+        "EUR_USD": 0.0005
     }
 
-    # Fetch all open trades once at the start of each run for efficiency
-    print("Fetching current open trades from OANDA...")
+    # --- Step 1: Fetch live account balance and calculate dynamic unit size ---
+    print("Fetching live account balance from OANDA...")
+    balance = get_account_balance()
+    print(f"Current Account Balance: ${balance:.2f}")
+
+    units = calculate_dynamic_units(balance)
+    print(f"Dynamic Unit Size Selected: {units} units (based on ${balance:.2f} balance)")
+    print(f"Protected Balance Floor: ${BALANCE_FLOOR:.2f} | Max Simultaneous Trades: {MAX_SIMULTANEOUS_TRADES}")
+
+    # --- Step 2: Fetch all open trades once at the start of each run ---
+    print("\nFetching current open trades from OANDA...")
     open_trades = get_open_trades()
     print(f"Open trades found: {len(open_trades)} / {MAX_SIMULTANEOUS_TRADES} max allowed")
     for t in open_trades:
         direction = "LONG" if float(t["currentUnits"]) > 0 else "SHORT"
         print(f"  - {t['instrument']} | {direction} | Units: {t['currentUnits']} | Trade ID: {t['id']}")
 
+    # --- Step 3: Run strategy for each pair using the dynamic unit size ---
     for pair, threshold in volatile_pairs.items():
-        trading_strategy(pair, open_trades, volatility_threshold=threshold, sl_atr_multiplier=1.0, tp_atr_multiplier=2.0)
+        trading_strategy(pair, open_trades, units, volatility_threshold=threshold,
+                         sl_atr_multiplier=1.0, tp_atr_multiplier=2.0)
 
 
 # Credentials: practice account | Account ID: 101-001-38830360-001
